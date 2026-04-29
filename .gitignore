@@ -1,0 +1,7 @@
+archive/
+models/
+*.pth
+*.pth
+*.csv
+__pycache__/
+.vscode/
