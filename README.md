@@ -18,5 +18,3 @@ Hệ thống phát hiện mã độc khai thác tiền mã hóa (Cryptojacking) 
 - Python, PyTorch, scikit-learn, pandas, imbalanced-learn
 - Streamlit (Web UI)
 
-**Nhóm G08**  
-Giảng viên: TS. Phan Thế Duy
