@@ -1,148 +1,145 @@
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import classification_report, confusion_matrix
 from imblearn.over_sampling import SMOTE
-from pathlib import Path
 import joblib
+from pathlib import Path
 
-models_dir = Path("models")
-models_dir.mkdir(exist_ok=True)
+# ====================== CONFIG ======================
+DATA_DIR = Path('data')
+MODEL_DIR = Path('models')
+MODEL_DIR.mkdir(exist_ok=True)
 
-print("=== Loading Kaggle dataset ===")
-base_dir = Path(__file__).parent
-normal_path = base_dir / "archive" / "final-normal-data-set.csv"
-anormal_path = base_dir / "archive" / "final-anormal-data-set.csv"
+BATCH_SIZE = 512
+NUM_EPOCHS = 50          # Giảm epochs
+LEARNING_RATE = 0.0003
+PATIENCE = 10
+DROPOUT = 0.6
+# ===================================================
 
-df_normal = pd.read_csv(normal_path, low_memory=False)
-df_anormal = pd.read_csv(anormal_path, low_memory=False)
+print("=" * 70)
+print("TRAINING CRYPTOJACKING NEURAL NETWORK - ANTI-OVERFITTING")
+print("=" * 70)
 
-df_normal['Label'] = 1
-df_anormal['Label'] = 0
-df = pd.concat([df_normal, df_anormal], ignore_index=True)
+# Load + Fill NaN
+train_df = pd.read_csv(DATA_DIR / 'train_crypto_hijacking.csv', low_memory=False)
+val_df   = pd.read_csv(DATA_DIR / 'val_crypto_hijacking.csv', low_memory=False)
+test_df  = pd.read_csv(DATA_DIR / 'test_crypto_hijacking.csv', low_memory=False)
 
-df = df.fillna(df.mean(numeric_only=True))
-numeric_cols = df.select_dtypes(include=['number']).columns
-df = df[numeric_cols]
+feature_cols = [col for col in train_df.columns if col not in ['label', 'timestamp']]
 
-X = df.drop('Label', axis=1).values.astype(np.float32)
-y = df['Label'].values.astype(np.float32)
+train_df[feature_cols] = train_df[feature_cols].fillna(train_df[feature_cols].median())
+val_df[feature_cols]   = val_df[feature_cols].fillna(train_df[feature_cols].median())
+test_df[feature_cols]  = test_df[feature_cols].fillna(train_df[feature_cols].median())
 
+X_train = train_df[feature_cols].values.astype(np.float32)
+y_train = train_df['label'].values
+
+X_val = val_df[feature_cols].values.astype(np.float32)
+y_val = val_df['label'].values
+
+X_test = test_df[feature_cols].values.astype(np.float32)
+y_test = test_df['label'].values
+
+# SMOTE only on train
 smote = SMOTE(random_state=42)
-X_bal, y_bal = smote.fit_resample(X, y)
+X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
 
+# Scale
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_bal)
+X_train_bal = scaler.fit_transform(X_train_bal)
+X_val = scaler.transform(X_val)
+X_test = scaler.transform(X_test)
 
-# ==================== Train / Validation / Test Split ====================
-X_train_val, X_test, y_train_val, y_test = train_test_split(
-    X_scaled, y_bal, test_size=0.2, random_state=42
-)
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train_val, y_train_val, test_size=0.25, random_state=42
-)
+joblib.dump(scaler, MODEL_DIR / 'scaler.pkl')
 
-X_train = torch.FloatTensor(X_train)
-X_val   = torch.FloatTensor(X_val)
-X_test  = torch.FloatTensor(X_test)
-y_train = torch.FloatTensor(y_train).unsqueeze(1)
-y_val   = torch.FloatTensor(y_val).unsqueeze(1)
-y_test  = torch.FloatTensor(y_test).unsqueeze(1)
+# Tensor
+X_train_t = torch.FloatTensor(X_train_bal)
+y_train_t = torch.FloatTensor(y_train_bal).unsqueeze(1)
+X_val_t   = torch.FloatTensor(X_val)
+y_val_t   = torch.FloatTensor(y_val).unsqueeze(1)
+X_test_t  = torch.FloatTensor(X_test)
+y_test_t  = torch.FloatTensor(y_test).unsqueeze(1)
 
-# ====================== Model Definition ======================
+# ====================== MODEL (Stronger Regularization) ======================
 class CryptoJackingModel(nn.Module):
     def __init__(self, input_size):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 128),
+            nn.Linear(input_size, 96),
             nn.ReLU(),
-            nn.Dropout(0.6),
-            nn.Linear(128, 64),
+            nn.Dropout(DROPOUT),
+            nn.Linear(96, 48),
             nn.ReLU(),
-            nn.Dropout(0.55),
-            nn.Linear(64, 32),
+            nn.Dropout(DROPOUT),
+            nn.Linear(48, 24),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(32, 1)
+            nn.Linear(24, 1)
         )
 
     def forward(self, x):
         return self.net(x)
 
 
-model = CryptoJackingModel(X_train.shape[1])
+model = CryptoJackingModel(X_train_t.shape[1])
 criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-3)
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 
-# ====================== Training with Early Stopping ======================
-print("Training model with early stopping...")
+# ====================== Training ======================
+print("\nStarting training...")
 
 best_val_loss = float('inf')
-patience = 15
 patience_counter = 0
 best_model_state = None
 
-for epoch in range(100):
-    # Training phase
+for epoch in range(NUM_EPOCHS):
     model.train()
     optimizer.zero_grad()
-    outputs = model(X_train)
-    loss = criterion(outputs, y_train)
+    outputs = model(X_train_t)
+    loss = criterion(outputs, y_train_t)
     loss.backward()
     optimizer.step()
 
-    # Validation phase
     model.eval()
     with torch.no_grad():
-        val_outputs = model(X_val)
-        val_loss = criterion(val_outputs, y_val).item()
+        val_outputs = model(X_val_t)
+        val_loss = criterion(val_outputs, y_val_t).item()
 
-    if epoch % 10 == 0 or epoch == 99:
+    if epoch % 5 == 0 or epoch == NUM_EPOCHS-1:
         print(f"Epoch {epoch:3d} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss:.4f}")
 
-    # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         best_model_state = model.state_dict().copy()
         patience_counter = 0
     else:
         patience_counter += 1
-        if patience_counter >= patience:
-            print(f"Early stopping triggered at epoch {epoch}")
+        if patience_counter >= PATIENCE:
+            print(f"Early stopping at epoch {epoch}")
             break
 
-# Load best model
-if best_model_state is not None:
+if best_model_state:
     model.load_state_dict(best_model_state)
 
-# ====================== Evaluation ======================
-print("\nEvaluating on test set...")
+# Save
+torch.save(model.state_dict(), MODEL_DIR / "cryptojacking_neural_network.pth")
+joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
 
+# ====================== Evaluation ======================
 model.eval()
 with torch.no_grad():
-    outputs = model(X_test)
+    outputs = model(X_test_t)
     pred = torch.sigmoid(outputs).round().squeeze().numpy()
-    y_true = y_test.squeeze().numpy()
+    y_true = y_test_t.squeeze().numpy()
 
-acc = accuracy_score(y_true, pred) * 100
-prec = precision_score(y_true, pred) * 100
-rec = recall_score(y_true, pred) * 100
-f1 = f1_score(y_true, pred) * 100
-
-print("\n=== MODEL PERFORMANCE ===")
-print(f"Accuracy   : {acc:.2f}%")
-print(f"Precision  : {prec:.2f}%")
-print(f"Recall     : {rec:.2f}%")
-print(f"F1-score   : {f1:.2f}%")
-
-# ====================== Save Model ======================
-torch.save(model.state_dict(), models_dir / "cryptojacking_model.pth")
-joblib.dump(scaler, models_dir / "scaler.pkl")
-
-print("\nModel and scaler saved successfully.")
-print(f"   - {models_dir}/cryptojacking_model.pth")
-print(f"   - {models_dir}/scaler.pkl")
+print("\n" + "="*60)
+print("FINAL MODEL PERFORMANCE ON TEST SET")
+print("="*60)
+print(classification_report(y_true, pred, target_names=['Normal', 'Crypto Hijacking'], digits=4))
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_true, pred))

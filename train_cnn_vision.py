@@ -3,116 +3,102 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from imblearn.over_sampling import SMOTE
 from pathlib import Path
 import joblib
 
-models_dir = Path("models")
-models_dir.mkdir(exist_ok=True)
+# ====================== PATHS ======================
+BASE_DIR   = Path(__file__).parent
+DATA_DIR   = BASE_DIR / "data"
+MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR.mkdir(exist_ok=True)
 
-print("=" * 70)
-print("CRYPTOJACKING DETECTION - VISION-BASED CNN MODEL")
-print("Inspired by Paper 2: A Holistic Intelligent CryptoJacking Malware Detection System")
-print("=" * 70)
-print("Dataset: Kaggle Cryptojacking (final-normal-data-set + final-anormal-data-set)\n")
+TARGET_SIZE = 64   # 8x8 image
+EPOCHS      = 50
+LR          = 0.0008
 
-base_dir = Path(__file__).parent
-normal_path = base_dir / "archive" / "final-normal-data-set.csv"
-anormal_path = base_dir / "archive" / "final-anormal-data-set.csv"
+# ====================== LOAD TRAIN ======================
+print("Loading train set...")
+train_df     = pd.read_csv(DATA_DIR / "train_crypto_hijacking.csv", low_memory=False)
+FEATURE_COLS = [c for c in train_df.columns if c != "label"]
 
-df_normal = pd.read_csv(normal_path, low_memory=False)
-df_anormal = pd.read_csv(anormal_path, low_memory=False)
+X_train_raw = train_df[FEATURE_COLS].values.astype(np.float32)
+y_train_raw = train_df["label"].values.astype(np.float32)
 
-df_normal['Label'] = 1
-df_anormal['Label'] = 0
-df = pd.concat([df_normal, df_anormal], ignore_index=True)
+# Fill NaN
+means = np.nanmean(X_train_raw, axis=0)
+mask  = np.isnan(X_train_raw)
+X_train_raw[mask] = np.take(means, np.where(mask)[1])
 
-df = df.fillna(df.mean(numeric_only=True))
-numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+# Pad to TARGET_SIZE
+if X_train_raw.shape[1] < TARGET_SIZE:
+    X_train_raw = np.pad(X_train_raw, ((0, 0), (0, TARGET_SIZE - X_train_raw.shape[1])))
+else:
+    X_train_raw = X_train_raw[:, :TARGET_SIZE]
 
-print(f"Number of numeric features detected: {len(numeric_cols)}")
+# ====================== SCALE ======================
+scaler  = StandardScaler()
+X_scaled = scaler.fit_transform(X_train_raw)
 
-# Pad to 64 features (8x8 image)
-X = df[numeric_cols].values.astype(np.float32)
-target_size = 64
-if X.shape[1] < target_size:
-    pad_width = target_size - X.shape[1]
-    X = np.pad(X, ((0, 0), (0, pad_width)), mode='constant', constant_values=0)
-    print(f"Padding {pad_width} zero columns to create 8x8 grayscale image representation")
+X_train = torch.FloatTensor(X_scaled.reshape(-1, 1, 8, 8))
+y_train = torch.FloatTensor(y_train_raw).unsqueeze(1)
 
-y = df['Label'].values.astype(np.float32)
+# Class weight thay cho SMOTE
+n_neg = (y_train_raw == 0).sum()
+n_pos = (y_train_raw == 1).sum()
+pos_weight = torch.tensor([n_neg / n_pos * 0.4])  # giảm bias về class anormal
+print(f"Class weight (pos/neg): {pos_weight.item():.3f}")
 
-smote = SMOTE(random_state=42)
-X_bal, y_bal = smote.fit_resample(X, y)
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X_bal)
-
-# Reshape to 8x8 image
-X_image = X_scaled.reshape(-1, 1, 8, 8)
-
-X_train, X_test, y_train, y_test = train_test_split(X_image, y_bal, test_size=0.3, random_state=42)
-
-X_train = torch.FloatTensor(X_train)
-X_test  = torch.FloatTensor(X_test)
-y_train = torch.FloatTensor(y_train).unsqueeze(1)
-y_test  = torch.FloatTensor(y_test).unsqueeze(1)
-
-# ====================== MODEL ARCHITECTURE ======================
-class VisionCryptoJackingCNN(nn.Module):
+# ====================== MODEL (nhỏ hơn) ======================
+class VisionCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Flatten(),
-            nn.Linear(64 * 2 * 2, 128), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(32 * 2 * 2, 64), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(64, 1),
         )
     def forward(self, x):
         return self.net(x)
 
-model = VisionCryptoJackingCNN()
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+model     = VisionCNN()
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-3)
 
-print("\n=== TRAINING PHASE ===")
-for epoch in range(30):
+# ====================== TRAIN ======================
+print(f"Training CNN ({EPOCHS} epochs)...")
+for epoch in range(EPOCHS):
+    model.train()
     optimizer.zero_grad()
-    outputs = model(X_train)
-    loss = criterion(outputs, y_train)
+    loss = criterion(model(X_train), y_train)
     loss.backward()
     optimizer.step()
-    if epoch % 5 == 0 or epoch == 29:
-        print(f"Epoch {epoch:2d} | Loss: {loss.item():.4f}")
+    if (epoch + 1) % 10 == 0:
+        print(f"  Epoch {epoch+1:2d}/{EPOCHS} | Loss: {loss.item():.4f}")
 
-# ====================== EVALUATION ======================
+# ====================== TRAIN METRICS ======================
 model.eval()
 with torch.no_grad():
-    outputs = model(X_test)
-    pred = torch.sigmoid(outputs).round().squeeze().numpy()
-    y_true = y_test.squeeze().numpy()
+    pred_train = (torch.sigmoid(model(X_train)).squeeze().numpy() > 0.5).astype(int)
 
-acc = accuracy_score(y_true, pred) * 100
-prec = precision_score(y_true, pred) * 100
-rec = recall_score(y_true, pred) * 100
-f1 = f1_score(y_true, pred) * 100
+y_true = y_train_raw.astype(int)
+acc  = accuracy_score(y_true, pred_train) * 100
+prec = precision_score(y_true, pred_train, pos_label=1, zero_division=0) * 100
+rec  = recall_score(y_true, pred_train,    pos_label=1, zero_division=0) * 100
+f1   = f1_score(y_true, pred_train,        pos_label=1, zero_division=0) * 100
 
-print("\n=== FINAL EVALUATION RESULTS ===")
-print(f"Accuracy   : {acc:.2f}%")
-print(f"Precision  : {prec:.2f}%")
-print(f"Recall     : {rec:.2f}%")
-print(f"F1-score   : {f1:.2f}%")
-print("\nModel training completed successfully.")
+print(f"\n[Train]")
+print(f"  Accuracy  : {acc:.2f}%")
+print(f"  Precision : {prec:.2f}%")
+print(f"  Recall    : {rec:.2f}%")
+print(f"  F1-Score  : {f1:.2f}%")
 
-torch.save(model.state_dict(), models_dir / "cnn_vision_model.pth")
-joblib.dump(scaler, models_dir / "scaler.pkl")
-
-print("\nModel files have been saved:")
-print(f"   • {models_dir.absolute()}/cnn_vision_model.pth")
-print(f"   • {models_dir.absolute()}/scaler.pkl")
+# ====================== SAVE ======================
+torch.save(model.state_dict(), MODELS_DIR / "cnn_vision_model.pth")
+joblib.dump(scaler, MODELS_DIR / "scaler_cnn.pkl")
+print("\nModels saved.")
